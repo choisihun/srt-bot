@@ -20,6 +20,7 @@ import time
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from functools import reduce
 
 
@@ -370,6 +371,15 @@ class KorailError(Exception):
         return f"{self.msg} ({self.code})"
 
 
+class ServiceUnavailableError(KorailError):
+    """서버가 현재 클라이언트를 지원하지 않을 때 반복 요청을 중단합니다."""
+
+
+class ReservationOutcomeUnknown(KorailError):
+    def __init__(self):
+        super().__init__("예약 결과가 불확실합니다. 코레일+의 예약 내역을 확인하세요. 자동 재시도를 중단합니다.")
+
+
 class NeedToLoginError(KorailError):
     codes = {"P058"}
 
@@ -529,14 +539,18 @@ class Korail:
         if auto_login:
             self.login(korail_id, korail_pw)
 
+    @property
+    def is_login(self):
+        return self.logined
+
     def _log(self, msg: str) -> None:
         if self.verbose:
-            print(f"[*] {msg}")
+            print("[*] 코레일 응답 수신")
 
     def __enc_password(self, password):
         url = API_ENDPOINTS["code"]
         data = {"code": "app.login.cphd"}
-        r = self._session.post(url, data=data)
+        r = self._session.post(url, data=data, timeout=30)
         j = json.loads(r.text)
 
         if j["strResult"] == "SUCC" and j.get("app.login.cphd"):
@@ -557,6 +571,7 @@ class Korail:
         if korail_pw:
             self.korail_pw = korail_pw
 
+        self.logined = False
         txt_input_flg = (
             "5"
             if EMAIL_REGEX.match(self.korail_id)
@@ -575,7 +590,7 @@ class Korail:
             "idx": self._idx,
         }
 
-        r = self._session.post(API_ENDPOINTS["login"], data=data)
+        r = self._session.post(API_ENDPOINTS["login"], data=data, timeout=30)
         self._log(r.text)
         j = json.loads(r.text)
 
@@ -585,13 +600,11 @@ class Korail:
             self.name = j["strCustNm"]
             self.email = j["strEmailAdr"]
             self.phone_number = j["strCpNo"]
-            print(
-                f"로그인 성공: {self.name} (멤버십번호: {self.membership_number}, 전화번호: {self.phone_number})"
-            )
+            print("코레일+ 로그인 성공")
             self.logined = True
             return True
-        self.logined = False
-        return False
+        self._result_check(j)
+        raise KorailError("코레일+ 로그인에 실패했습니다. 통합회원 전환 및 계정 정보를 확인하세요.")
 
     def logout(self):
         r = self._session.get(API_ENDPOINTS["logout"])
@@ -600,12 +613,19 @@ class Korail:
 
     def _result_check(self, j):
         if j.get("strResult") == "FAIL":
+            if j.get("h_msg_cd") == "MACRO ERROR":
+                raise ServiceUnavailableError(
+                    "코레일 서버가 현재 API 클라이언트를 거부했습니다. 공식 코레일+ 앱을 이용하세요.",
+                    "MACRO ERROR",
+                )
             h_msg_cd = j.get("h_msg_cd")
             h_msg_txt = j.get("h_msg_txt")
             for error in (NoResultsError, NeedToLoginError, SoldOutError):
                 if h_msg_cd in error.codes:
                     raise error(h_msg_cd)
             raise KorailError(h_msg_txt, h_msg_cd)
+        if j.get("strResult") != "SUCC":
+            raise KorailError("코레일 응답 형식을 확인할 수 없습니다.")
         return True
 
     def search_train(
@@ -618,8 +638,9 @@ class Korail:
         passengers=None,
         include_no_seats=False,
         include_waiting_list=False,
+        include_srt=True,
     ):
-        kst_now = datetime.now() + timedelta(hours=9)
+        kst_now = datetime.now(ZoneInfo("Asia/Seoul"))
         date = date or kst_now.strftime("%Y%m%d")
         time = time or kst_now.strftime("%H%M%S")
         passengers = passengers or [AdultPassenger()]
@@ -663,13 +684,13 @@ class Korail:
             "txtSeatAttCd_3": "000",
             "txtSeatAttCd_4": "015",
             "ebizCrossCheck": "N",
-            "srtCheckYn": "N",  # SRT 함께 보기
+            "srtCheckYn": "Y" if include_srt else "N",  # 통합 조회
             "rtYn": "N",  # 왕복
             "adjStnScdlOfrFlg": "N",  # 인접역 보기
             "mbCrdNo": self.membership_number,
         }
 
-        r = self._session.get(API_ENDPOINTS["search_schedule"], params=data)
+        r = self._session.get(API_ENDPOINTS["search_schedule"], params=data, timeout=30)
         self._log(r.text)
         j = json.loads(r.text)
 
@@ -692,6 +713,8 @@ class Korail:
             return trains
 
     def reserve(self, train, passengers=None, option=ReserveOption.GENERAL_FIRST):
+        if not self.logined:
+            raise NeedToLoginError()
         reserving_seat = train.has_seat() or train.wait_reserve_flag < 0
         if reserving_seat:
             is_special_seat = {
@@ -757,15 +780,29 @@ class Korail:
         for i, psg in enumerate(passengers, 1):
             data.update(psg.get_dict(i))
 
-        r = self._session.get(API_ENDPOINTS["reserve"], params=data)
-        self._log(r.text)
-        j = json.loads(r.text)
-        if self._result_check(j):
-            rsv_id = j.get("h_pnr_no")
+        # 요청을 보낸 뒤 네트워크/파싱 오류가 나면 예약 성공 여부를 알 수 없습니다.
+        try:
+            r = self._session.get(API_ENDPOINTS["reserve"], params=data, timeout=30)
+            self._log(r.text)
+            j = json.loads(r.text)
+        except Exception as exc:
+            raise ReservationOutcomeUnknown() from exc
+        try:
+            self._result_check(j)
+        except KorailError as exc:
+            if isinstance(j, dict) and j.get("strResult") == "FAIL":
+                raise
+            raise ReservationOutcomeUnknown() from exc
+        rsv_id = j.get("h_pnr_no")
+        if not rsv_id:
+            raise ReservationOutcomeUnknown()
+        try:
             reservation = self.reservations(rsv_id)
-            return reservation
-        else:
-            raise SoldOutError()
+        except Exception as exc:
+            raise ReservationOutcomeUnknown() from exc
+        if reservation is None:
+            raise ReservationOutcomeUnknown()
+        return reservation
 
     def tickets(self):
         data = {
